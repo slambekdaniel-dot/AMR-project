@@ -1,0 +1,220 @@
+#include <micro_ros_arduino.h>
+#include <rcl/rcl.h>
+#include <rclc/rclc.h>
+#include <sensor_msgs/msg/laser_scan.h>
+#include <nav_msgs/msg/odometry.h>
+
+#define SIZE 5
+
+// -------- МОТОРЫ --------
+#define L1 13
+#define L2 27
+#define L3 12
+#define L4 14
+
+#define R1 4
+#define R2 0
+#define R3 4
+#define R4 0
+
+// -------- СЕНСОРЫ --------
+#define TRIG_FRONT 32
+#define ECHO_FRONT 35
+#define TRIG_RIGHT 16
+#define ECHO_RIGHT 17
+#define TRIG_LEFT 25
+#define ECHO_LEFT 33
+
+// -------- ROS --------
+rcl_publisher_t scan_pub;
+rcl_publisher_t odom_pub;
+
+rcl_node_t node;
+rclc_support_t support;
+rcl_allocator_t allocator;
+
+sensor_msgsmsgLaserScan scan_msg;
+nav_msgsmsgOdometry odom_msg;
+
+// -------- ПЕРЕМЕННЫЕ --------
+int posX = 0;
+int posY = 0;
+int dir = 0; // 0=N 1=E 2=S 3=W
+
+int motorSpeed = 120;
+int stepTime = 600;
+int turnTime90 = 320;
+
+// -------- ДИСТАНЦИЯ --------
+float getDistance(int trig, int echo) {
+  digitalWrite(trig, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trig, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+
+  long duration = pulseIn(echo, HIGH, 25000);
+  float d = duration * 0.034 / 2;
+  if (d <= 0) return 999;
+  return d;
+}
+
+// -------- МОТОРЫ --------
+void stopMotors() {
+  analogWrite(L1,0); analogWrite(L2,0);
+  analogWrite(L3,0); analogWrite(L4,0);
+  analogWrite(R1,0); analogWrite(R2,0);
+  analogWrite(R3,0); analogWrite(R4,0);
+  delay(100);
+}
+
+// -------- ДВИЖЕНИЕ С УЧЁТОМ СКОРОСТИ --------
+void forwardStep() {
+
+  analogWrite(L2, motorSpeed);
+  analogWrite(L4, motorSpeed);
+  analogWrite(R2, motorSpeed);
+  analogWrite(R4, motorSpeed);
+
+  delay(stepTime);
+  stopMotors();
+
+  //  расстояние зависит от скорости
+  float distance = motorSpeed * stepTime * 0.0001;
+
+  if(dir==0) posY += distance;
+  if(dir==1) posX += distance;
+  if(dir==2) posY -= distance;
+  if(dir==3) posX -= distance;
+}
+
+void turnLeft() {
+  analogWrite(L1, motorSpeed);
+  analogWrite(L3, motorSpeed);
+  analogWrite(R2, motorSpeed);
+  analogWrite(R4, motorSpeed);
+
+  delay(turnTime90);
+  stopMotors();
+
+  dir = (dir + 3) % 4;
+}
+
+void turnRight() {
+  analogWrite(L2, motorSpeed);
+  analogWrite(L4, motorSpeed);
+  analogWrite(R1, motorSpeed);
+  analogWrite(R3, motorSpeed);
+
+  delay(turnTime90);
+  stopMotors();
+
+  dir = (dir + 1) % 4;
+}
+
+// -------- SETUP --------
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(TRIG_FRONT, OUTPUT);
+  pinMode(ECHO_FRONT, INPUT);
+  pinMode(TRIG_LEFT, OUTPUT);
+  pinMode(ECHO_LEFT, INPUT);
+  pinMode(TRIG_RIGHT, OUTPUT);
+  pinMode(ECHO_RIGHT, INPUT);
+
+  pinMode(L1,OUTPUT); pinMode(L2,OUTPUT);
+  pinMode(L3,OUTPUT); pinMode(L4,OUTPUT);
+  pinMode(R1,OUTPUT); pinMode(R2,OUTPUT);
+  pinMode(R3,OUTPUT); pinMode(R4,OUTPUT);
+
+  // WiFi
+  set_microros_wifi_transports(
+    (char*)"robot_net",
+    (char*)"12345678",
+    (char*)"10.236.95.207",
+    8888
+  );
+
+  delay(2000);
+
+  allocator = rcl_get_default_allocator();
+  rclc_support_init(&support, 0, NULL, &allocator);
+  rclc_node_init_default(&node, "esp32_node", "", &support);
+
+  // scan publisher
+  rclc_publisher_init_default(
+    &scan_pub,
+    &node,
+    ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, LaserScan),
+    "/scan"
+  );
+
+  // odom publisher
+  rclc_publisher_init_default(
+    &odom_pub,
+    &node,
+    ROSIDL_GET_MSG_TYPE_SUPPORT(nav_msgs, msg, Odometry),
+    "/odom"
+  );
+
+  // -------- scan setup --------
+  scan_msg.header.frame_id.data = (char*)"base_link";
+  scan_msg.header.frame_id.size = 9;
+  scan_msg.header.frame_id.capacity = 9;
+
+  scan_msg.angle_min = -1.57;
+  scan_msg.angle_max = 1.57;
+  scan_msg.angle_increment = 0.785;
+
+  scan_msg.range_min = 0.02;
+  scan_msg.range_max = 3.5;
+
+  scan_msg.ranges.data = (float*) malloc(5 * sizeof(float));
+  scan_msg.ranges.size = 5;
+  scan_msg.ranges.capacity = 5;
+
+  // -------- odom setup --------
+  odom_msg.header.frame_id.data = (char*)"odom";
+  odom_msg.child_frame_id.data = (char*)"base_link";
+}
+
+// -------- LOOP --------
+void loop() {
+
+  float l = getDistance(TRIG_LEFT, ECHO_LEFT) / 100.0;
+  float f = getDistance(TRIG_FRONT, ECHO_FRONT) / 100.0;
+  float r = getDistance(TRIG_RIGHT, ECHO_RIGHT) / 100.0;
+
+  if(l <= 0 || l > 4) l = 3.5;
+  if(f <= 0 || f > 4) f = 3.5;
+  if(r <= 0 || r > 4) r = 3.5;
+
+  // fake lidar (5 лучей)
+  scan_msg.ranges.data[0] = l;
+  scan_msg.ranges.data[1] = (l+f)/2;
+  scan_msg.ranges.data[2] = f;
+  scan_msg.ranges.data[3] = (f+r)/2;
+  scan_msg.ranges.data[4] = r;
+
+  rcl_publish(&scan_pub, &scan_msg, NULL);
+
+  // -------- ODOM --------
+  float theta = dir * 1.57;
+
+  odom_msg.pose.pose.position.x = posX;
+  odom_msg.pose.pose.position.y = posY;
+
+  odom_msg.pose.pose.orientation.z = sin(theta/2);
+  odom_msg.pose.pose.orientation.w = cos(theta/2);
+
+  rcl_publish(&odom_pub, &odom_msg, NULL);
+
+  // -------- ПРОСТАЯ ЛОГИКА --------
+  if(f < 20) {
+    if(l > r) turnLeft();
+    else turnRight();
+  } else {
+    forwardStep();
+  }
+}
