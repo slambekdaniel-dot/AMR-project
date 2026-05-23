@@ -1,12 +1,16 @@
 #include <micro_ros_arduino.h>
 #include <rcl/rcl.h>
 #include <rclc/rclc.h>
-#include <sensor_msgs/msg/laser_scan.h>
+
 #include <nav_msgs/msg/odometry.h>
+#include <sensor_msgs/msg/laser_scan.h>
+#include <tf2_msgs/msg/tf_message.h>
+#include <geometry_msgs/msg/transform_stamped.h>
 
-#define SIZE 5
+#include <math.h>
+#include <string.h>
 
-// -------- МОТОРЫ --------
+// ---------------- MOTORS ----------------
 #define L1 13
 #define L2 27
 #define L3 12
@@ -17,35 +21,70 @@
 #define R3 4
 #define R4 0
 
-// -------- СЕНСОРЫ --------
+// ---------------- SENSORS ----------------
 #define TRIG_FRONT 32
 #define ECHO_FRONT 35
-#define TRIG_RIGHT 16
-#define ECHO_RIGHT 17
-#define TRIG_LEFT 25
-#define ECHO_LEFT 33
+#define TRIG_RIGHT 25
+#define ECHO_RIGHT 33
+#define TRIG_LEFT 16
+#define ECHO_LEFT 17
 
-// -------- ROS --------
-rcl_publisher_t scan_pub;
-rcl_publisher_t odom_pub;
+// ---------------- GRID ----------------
+#define GRID_SIZE 50
+int grid[GRID_SIZE][GRID_SIZE];
 
+int gx = GRID_SIZE / 2;
+int gy = GRID_SIZE / 2;
+
+// ---------------- ROS ----------------
 rcl_node_t node;
 rclc_support_t support;
 rcl_allocator_t allocator;
 
-sensor_msgsmsgLaserScan scan_msg;
-nav_msgsmsgOdometry odom_msg;
+rcl_publisher_t scan_pub;
+rcl_publisher_t odom_pub;
+rcl_publisher_t tf_pub;
 
-// -------- ПЕРЕМЕННЫЕ --------
-int posX = 0;
-int posY = 0;
-int dir = 0; // 0=N 1=E 2=S 3=W
+sensor_msgs__msg__LaserScan scan_msg;
+nav_msgs__msg__Odometry odom_msg;
+tf2_msgs__msg__TFMessage tf_msg;
+geometry_msgs__msg__TransformStamped transform;
 
-int motorSpeed = 120;
-int stepTime = 600;
-int turnTime90 = 320;
+// ---------------- ROBOT STATE ----------------
+float posX = 0;
+float posY = 0;
+float theta = 0;
 
-// -------- ДИСТАНЦИЯ --------
+int sensorPhase = 0;
+float l = 0, f = 0, r = 0;
+
+// ---------------- CONTROL ----------------
+int speedMotor = 140;
+int speedMotorLeft = 120;
+int speedMotorRight = 110;
+int stepTime = 920;
+int turnTime = 400;
+int turnSpeedRight = 210;
+int turnSpeedLeft = 230;
+
+int escape_steps = 0;
+
+bool robotMoving = false;
+
+// ---------------- UTILS ----------------
+float normalizeAngle(float a) {
+  while (a > M_PI) a -= 2*M_PI;
+  while (a < -M_PI) a += 2*M_PI;
+  return a;
+}
+
+void snapToGrid() {
+  float step = M_PI / 2;
+  theta = round(theta / step) * step;
+  theta = normalizeAngle(theta);
+}
+
+// ---------------- DISTANCE ----------------
 float getDistance(int trig, int echo) {
   digitalWrite(trig, LOW);
   delayMicroseconds(2);
@@ -53,66 +92,147 @@ float getDistance(int trig, int echo) {
   delayMicroseconds(10);
   digitalWrite(trig, LOW);
 
-  long duration = pulseIn(echo, HIGH, 25000);
+  long duration = pulseIn(echo, HIGH, 12000);  // ~2 meters max
+  if (duration == 0) return 999;
+
   float d = duration * 0.034 / 2;
-  if (d <= 0) return 999;
+  if (d < 2 || d > 300) return 999;
+
   return d;
 }
 
-// -------- МОТОРЫ --------
-void stopMotors() {
-  analogWrite(L1,0); analogWrite(L2,0);
-  analogWrite(L3,0); analogWrite(L4,0);
-  analogWrite(R1,0); analogWrite(R2,0);
-  analogWrite(R3,0); analogWrite(R4,0);
-  delay(100);
+
+
+// ---------------- GRID ----------------
+int dirX(float angle) { return round(cos(angle)); }
+int dirY(float angle) { return round(sin(angle)); }
+
+bool visited(int x, int y) {
+  if (x < 0 || x >= GRID_SIZE || y < 0 || y >= GRID_SIZE) return true;
+  return grid[x][y] == 1;
 }
 
-// -------- ДВИЖЕНИЕ С УЧЁТОМ СКОРОСТИ --------
-void forwardStep() {
+void markVisited() {
+  grid[gx][gy] = 1;
+}
 
-  analogWrite(L2, motorSpeed);
-  analogWrite(L4, motorSpeed);
-  analogWrite(R2, motorSpeed);
-  analogWrite(R4, motorSpeed);
+void getFrontCell(int &x, int &y) {
+  x = gx + dirX(theta);
+  y = gy + dirY(theta);
+}
 
-  delay(stepTime);
+void getLeftCell(int &x, int &y) {
+  x = gx + dirX(theta - M_PI_2);
+  y = gy + dirY(theta - M_PI_2);
+}
+
+void getRightCell(int &x, int &y) {
+  x = gx + dirX(theta + M_PI_2);
+  y = gy + dirY(theta + M_PI_2);
+}
+
+// ---------------- MOTORS ----------------
+void stopMotors() {
+  analogWrite(L1, 0); analogWrite(L2, 0);
+  analogWrite(L3, 0); analogWrite(L4, 0);
+  analogWrite(R1, 0); analogWrite(R2, 0);
+  analogWrite(R3, 0); analogWrite(R4, 0);
+}
+
+void brakeMotors() {
+  analogWrite(L1, 120);
+  analogWrite(L3, 120);
+  analogWrite(R1, 120);
+  analogWrite(R3, 120);
+  delay(40);
+  stopMotors();
+}
+
+// ---------------- SAFE FORWARD ----------------
+void forwardStepSafe() {
+
+  robotMoving = true;
+
+  float f = getDistance(TRIG_FRONT, ECHO_FRONT) / 100.0;
+  if (f < 0.25) {
+    robotMoving = false;
+    return;
+  }
+
+  analogWrite(L2, speedMotorLeft);
+  analogWrite(L4, speedMotorLeft);
+  analogWrite(R2, speedMotorRight);
+  analogWrite(R4, speedMotorRight);
+
+  unsigned long start = millis();
+
+  while (millis() - start < stepTime) {
+
+    float f_live = getDistance(TRIG_FRONT, ECHO_FRONT) / 100.0;
+
+    if (f_live < 0.07) {
+      brakeMotors();
+      robotMoving = false;
+      return;
+    }
+  }
+
+  brakeMotors();
+
+  float step = 0.30; // REAL DISTANCE
+
+  posX += step * cos(theta);
+  posY += step * sin(theta);
+
+  gx += dirX(theta);
+  gy += dirY(theta);
+
+  markVisited();
+
+  robotMoving = false;
+}
+
+// ---------------- TURNS ----------------
+void turnRight() {
+
+  robotMoving = true;
+
+  analogWrite(L1, turnSpeedRight);
+  analogWrite(L3, turnSpeedRight);
+  analogWrite(R2, turnSpeedRight);
+  analogWrite(R4, turnSpeedRight);
+
+  delay(turnTime);
+
   stopMotors();
 
-  //  расстояние зависит от скорости
-  float distance = motorSpeed * stepTime * 0.0001;
+   theta += 1.5708;
 
-  if(dir==0) posY += distance;
-  if(dir==1) posX += distance;
-  if(dir==2) posY -= distance;
-  if(dir==3) posX -= distance;
+  snapToGrid();
+
+  robotMoving = false;
 }
 
 void turnLeft() {
-  analogWrite(L1, motorSpeed);
-  analogWrite(L3, motorSpeed);
-  analogWrite(R2, motorSpeed);
-  analogWrite(R4, motorSpeed);
 
-  delay(turnTime90);
+  robotMoving = true;
+
+  analogWrite(L2, turnSpeedLeft);
+  analogWrite(L4, turnSpeedLeft);
+  analogWrite(R1, turnSpeedLeft);
+  analogWrite(R3, turnSpeedLeft);
+
+  delay(turnTime);
   stopMotors();
 
-  dir = (dir + 3) % 4;
+   theta -= 1.5708;
+
+  snapToGrid();
+
+  robotMoving = false;
 }
 
-void turnRight() {
-  analogWrite(L2, motorSpeed);
-  analogWrite(L4, motorSpeed);
-  analogWrite(R1, motorSpeed);
-  analogWrite(R3, motorSpeed);
-
-  delay(turnTime90);
-  stopMotors();
-
-  dir = (dir + 1) % 4;
-}
-
-// -------- SETUP --------
+// ---------------- SETUP ----------------
 void setup() {
   Serial.begin(115200);
 
@@ -123,16 +243,18 @@ void setup() {
   pinMode(TRIG_RIGHT, OUTPUT);
   pinMode(ECHO_RIGHT, INPUT);
 
-  pinMode(L1,OUTPUT); pinMode(L2,OUTPUT);
-  pinMode(L3,OUTPUT); pinMode(L4,OUTPUT);
-  pinMode(R1,OUTPUT); pinMode(R2,OUTPUT);
-  pinMode(R3,OUTPUT); pinMode(R4,OUTPUT);
+  pinMode(L1, OUTPUT); pinMode(L2, OUTPUT);
+  pinMode(L3, OUTPUT); pinMode(L4, OUTPUT);
+  pinMode(R1, OUTPUT); pinMode(R2, OUTPUT);
+  pinMode(R3, OUTPUT); pinMode(R4, OUTPUT);
 
-  // WiFi
+  memset(grid, 0, sizeof(grid));
+  markVisited();
+
   set_microros_wifi_transports(
-    (char*)"robot_net",
-    (char*)"12345678",
-    (char*)"10.236.95.207",
+    (char*)"A56 пользователя Dan",
+    (char*)"daniko123",
+    (char*)"10.235.20.207",
     8888
   );
 
@@ -140,81 +262,161 @@ void setup() {
 
   allocator = rcl_get_default_allocator();
   rclc_support_init(&support, 0, NULL, &allocator);
-  rclc_node_init_default(&node, "esp32_node", "", &support);
+  rclc_node_init_default(&node, "esp32_robot", "", &support);
 
-  // scan publisher
-  rclc_publisher_init_default(
-    &scan_pub,
-    &node,
-    ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, LaserScan),
-    "/scan"
-  );
+  sensor_msgs__msg__LaserScan__init(&scan_msg);
+  nav_msgs__msg__Odometry__init(&odom_msg);
+  tf2_msgs__msg__TFMessage__init(&tf_msg);
+  geometry_msgs__msg__TransformStamped__init(&transform);
 
-  // odom publisher
-  rclc_publisher_init_default(
-    &odom_pub,
-    &node,
-    ROSIDL_GET_MSG_TYPE_SUPPORT(nav_msgs, msg, Odometry),
-    "/odom"
-  );
+  rclc_publisher_init_default(&scan_pub, &node,
+    ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, LaserScan), "/scan");
 
-  // -------- scan setup --------
+  rclc_publisher_init_default(&odom_pub, &node,
+    ROSIDL_GET_MSG_TYPE_SUPPORT(nav_msgs, msg, Odometry), "/odom");
+
+  rclc_publisher_init_default(&tf_pub, &node,
+    ROSIDL_GET_MSG_TYPE_SUPPORT(tf2_msgs, msg, TFMessage), "/tf");
+
+  // Laser config
   scan_msg.header.frame_id.data = (char*)"base_link";
-  scan_msg.header.frame_id.size = 9;
-  scan_msg.header.frame_id.capacity = 9;
+  scan_msg.header.frame_id.size = strlen("base_link");
+  scan_msg.header.frame_id.capacity = 20;
 
-  scan_msg.angle_min = -1.57;
-  scan_msg.angle_max = 1.57;
-  scan_msg.angle_increment = 0.785;
+  scan_msg.angle_min = -1.5708;
+  scan_msg.angle_max = 1.5708;
+  scan_msg.angle_increment = 1.5708;
 
   scan_msg.range_min = 0.02;
   scan_msg.range_max = 3.5;
 
-  scan_msg.ranges.data = (float*) malloc(5 * sizeof(float));
-  scan_msg.ranges.size = 5;
-  scan_msg.ranges.capacity = 5;
+  scan_msg.ranges.data = (float*) malloc(3 * sizeof(float));
+  scan_msg.ranges.size = 3;
+  scan_msg.ranges.capacity = 3;
 
-  // -------- odom setup --------
-  odom_msg.header.frame_id.data = (char*)"odom";
-  odom_msg.child_frame_id.data = (char*)"base_link";
+  // ---------------- TF ----------------
+  transform.header.frame_id.data = (char*)"odom";
+  transform.header.frame_id.size = strlen("odom");
+  transform.header.frame_id.capacity = 10;
+
+  transform.child_frame_id.data = (char*)"base_link";
+  transform.child_frame_id.size = strlen("base_link");
+  transform.child_frame_id.capacity = 20;
+
+  tf_msg.transforms.data = &transform;
+  tf_msg.transforms.size = 1;
+  tf_msg.transforms.capacity = 1;
+  tf_msg.transforms.size = 1;
+  tf_msg.transforms.capacity = 1;
 }
-
-// -------- LOOP --------
+// ---------------- LOOP ----------------
 void loop() {
 
+  uint32_t ms = millis();
+  int32_t sec = ms / 1000;
+  uint32_t nanosec = (ms % 1000) * 1000000;
+
   float l = getDistance(TRIG_LEFT, ECHO_LEFT) / 100.0;
+  delay(25);
+  
   float f = getDistance(TRIG_FRONT, ECHO_FRONT) / 100.0;
+  delay(25);
+  
   float r = getDistance(TRIG_RIGHT, ECHO_RIGHT) / 100.0;
+  delay(25);
 
-  if(l <= 0 || l > 4) l = 3.5;
-  if(f <= 0 || f > 4) f = 3.5;
-  if(r <= 0 || r > 4) r = 3.5;
+  float WALL = 0.21;
+ 
 
-  // fake lidar (5 лучей)
-  scan_msg.ranges.data[0] = l;
-  scan_msg.ranges.data[1] = (l+f)/2;
-  scan_msg.ranges.data[2] = f;
-  scan_msg.ranges.data[3] = (f+r)/2;
-  scan_msg.ranges.data[4] = r;
+  bool left_free  = l > WALL;
+  bool front_free = f > WALL;
+  bool right_free = r > WALL;
 
-  rcl_publish(&scan_pub, &scan_msg, NULL);
 
-  // -------- ODOM --------
-  float theta = dir * 1.57;
+  int fx, fy, lx, ly, rx, ry;
+  
+  getFrontCell(fx, fy);
+  getLeftCell(lx, ly);
+  getRightCell(rx, ry);
+  
+  if (front_free && !visited(fx, fy)) {
+    forwardStepSafe();
+  }
+  else if (left_free && !visited(lx, ly)) {
+    turnLeft();
+  }
+  else if (right_free && !visited(rx, ry)) {
+    turnRight();
+  }
+  else if (front_free) {
+    forwardStepSafe();
+  }
+  else if (left_free) {
+    turnLeft();
+  }
+  else if (right_free) {
+    turnRight();
+  }
+  else {
+    turnRight();
+    turnRight();
+    delay(100);
+    escape_steps = 2;
+  }
 
+  // -------- PUBLISH --------
+ // -------- TF --------
+  transform.header.stamp.sec = sec;
+  transform.header.stamp.nanosec = nanosec;
+  
+  transform.header.frame_id.data = (char*)"odom";
+  transform.header.frame_id.size = strlen("odom");
+  transform.header.frame_id.capacity = 10;
+  
+  transform.child_frame_id.data = (char*)"base_link";
+  transform.child_frame_id.size = strlen("base_link");
+  transform.child_frame_id.capacity = 20;
+  
+  transform.transform.translation.x = posX;
+  transform.transform.translation.y = posY;
+  transform.transform.translation.z = 0;
+  
+  transform.transform.rotation.x = 0;
+  transform.transform.rotation.y = 0;
+  transform.transform.rotation.z = sin(theta/2);
+  transform.transform.rotation.w = cos(theta/2);
+
+  scan_msg.header.stamp.sec = sec;
+  scan_msg.header.stamp.nanosec = nanosec;
+
+  if (!robotMoving) {
+  
+    scan_msg.ranges.data[0] = l;
+    scan_msg.ranges.data[1] = f;
+    scan_msg.ranges.data[2] = r;
+  
+    rcl_publish(&scan_pub, &scan_msg, NULL);
+  }
+
+    // -------- ODOM --------
+  odom_msg.header.stamp.sec = sec;
+  odom_msg.header.stamp.nanosec = nanosec;
+  
+  odom_msg.header.frame_id.data = (char*)"odom";
+  odom_msg.child_frame_id.data = (char*)"base_link";
+  
   odom_msg.pose.pose.position.x = posX;
   odom_msg.pose.pose.position.y = posY;
-
+  
+  odom_msg.pose.pose.orientation.x = 0;
+  odom_msg.pose.pose.orientation.y = 0;
   odom_msg.pose.pose.orientation.z = sin(theta/2);
   odom_msg.pose.pose.orientation.w = cos(theta/2);
+  
+//  odom_msg.pose.covariance[0] = 0.01;
+//  odom_msg.pose.covariance[7] = 0.01;
+//  odom_msg.pose.covariance[35] = 0.05;
 
+  rcl_publish(&tf_pub, &tf_msg, NULL);
   rcl_publish(&odom_pub, &odom_msg, NULL);
-
-  // -------- ПРОСТАЯ ЛОГИКА --------
-  if(f < 20) {
-    if(l > r) turnLeft();
-    else turnRight();
-  } else {
-    forwardStep();
-  }
 }
